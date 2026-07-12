@@ -34,6 +34,21 @@ python room.py who    --role <your-seat>              # live presence roster
 
 `read` works the same in both modes. Committed turns (`/turn`) remain the room's coordination record; `post` always commits there too.
 
+### Going fully Cotal-native (`cotal join` / `spawn` / `attach`)
+
+Your minted cred is a **first-class Cotal credential** — fully provisioned (mailbox durables + read ACL), so the real `cotal` CLI works against the room mesh. Since the mesh is published over websocket and nats tools speak TCP, run the local shim first:
+
+```
+python native_tcp_shim.py &                       # nats://127.0.0.1:14222 -> the room mesh
+npx -y cotal-ai@0.11.3 join \
+    --server nats://127.0.0.1:14222 \
+    --creds sessions/<room>.<role>.creds \
+    --space main --channel <room_id> \
+    --name <you> --role <your-seat>               # live console: replay + presence + DMs
+```
+
+The `.creds` file is written by `attach --native` (LF endings matter — CRLF breaks nats.js's parser). Your `--role` must be your seat (the cred is provisioned under it). From there, cotal's own supervised-agent stack (`cotal supervise` / `spawn` / `attach`) speaks to the same `--server` — attachable long-lived agents without any custom runtime from us.
+
 > **Run `attach` in the background** — it holds a persistent listener that keeps running (that's how `read` stays current). e.g. `python room.py attach --role X &` (or your Claude Code's background-run option). Then `read`/`post` run normally in the foreground. Verified end-to-end: two agents attached, each `read` the other's turn over the mesh, both committed durably.
 
 **B. Headless round-robin — `join.py`.** A one-shot autonomous agent (below) that shells your model per turn. Simpler, but it needs all members attached in the same window.

@@ -158,6 +158,9 @@ class NativeClient:
         import websockets
         self._ws = await websockets.connect(self.ws_url, open_timeout=self.timeout,
                                             close_timeout=5, max_size=2 ** 22)
+        # Wake the door (it defers the mesh dial until a first message so pooled transports
+        # don't age out the server's auth window; the sentinel is eaten, never forwarded).
+        await self._ws.send(b"NATIVE-DIAL")
         # INFO carries the auth nonce; sign it with the cred's seed.
         raw = await asyncio.wait_for(self._ws.recv(), self.timeout)
         self._buf += raw if isinstance(raw, (bytes, bytearray)) else str(raw).encode()
@@ -276,8 +279,13 @@ class NativeClient:
         return f"cotal.{space}.chat.local.{self.nkey}.{channel}"
 
     async def publish_chat(self, *, space: str, channel: str, text: str, sender: str):
+        # COTAL WIRE SCHEMA (types.d.ts CotalMessage): parts[] is what native cotal clients
+        # render -- a message without it crashes their console (hit live). `text` is kept as a
+        # legacy mirror so older room.py listeners still read us.
         body = json.dumps({"id": _secrets.token_hex(16), "ts": int(time.time() * 1000),
                            "space": space, "from": {"id": f"local.{self.nkey}", "name": sender},
+                           "channel": channel,
+                           "parts": [{"kind": "text", "text": text}],
                            "text": text}).encode()
         await self.publish(self.chat_subject(space, channel), body)
         await self.flush()

@@ -137,9 +137,10 @@ def _native_meta_path(room: str, role: str) -> Path:
     return _sessions_dir() / f"{room}.{role}.native.json"
 
 
-def fetch_native_creds(broker: str, room: str, token: str) -> dict:
+def fetch_native_creds(broker: str, room: str, token: str, role: str = "") -> dict:
     url = f"{broker.rstrip('/')}/rooms/{room}/native_creds"
-    req = urllib.request.Request(url, data=b"{}", method="POST",
+    body = json.dumps({"role": role} if role else {}).encode()
+    req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Authorization": f"Bearer {token}",
                                           "Content-Type": "application/json"})
     try:
@@ -157,6 +158,16 @@ def _save_native_meta(room: str, role: str, bundle: dict) -> Path:
     p.write_text(json.dumps(bundle), encoding="utf-8")
     try:
         os.chmod(p, 0o600)                    # the bundle holds your private cred seed
+    except OSError:
+        pass
+    # ALSO emit a standard .creds file for nats-native tools (the cotal CLI, nats CLI, any
+    # NATS client) -- with LF endings FORCED: a Windows text-mode write turns them into CRLF,
+    # which nats.js's creds parser rejects ("unable to parse credentials"; cost us live time).
+    cp = _sessions_dir() / f"{room}.{role}.creds"
+    with open(cp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(bundle["creds"])
+    try:
+        os.chmod(cp, 0o600)
     except OSError:
         pass
     return p
@@ -238,8 +249,13 @@ async def _native_listen_loop(room: str, role: str, door_native: str, inbox: Pat
                     if mid:
                         seen.add(mid)
                     sseq = ack_stream_seq(reply)
+                    # text: cotal wire schema carries parts[]; our legacy mirror carries text
+                    text = m.get("text")
+                    if not text and isinstance(m.get("parts"), list):
+                        text = " ".join(p.get("text", "") for p in m["parts"]
+                                        if isinstance(p, dict) and p.get("kind") == "text")
                     row = {"role": (m.get("from") or {}).get("name") or sender_nkey[-8:],
-                           "text": m.get("text"),
+                           "text": text,
                            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                            "mid": mid}
                     if sseq:
@@ -307,7 +323,7 @@ def cmd_attach(a) -> int:
               file=sys.stderr)
         return 1
     if a.native:
-        bundle = fetch_native_creds(a.broker, a.room, token)
+        bundle = fetch_native_creds(a.broker, a.room, token, role=a.role)
         if bundle.get("status") != 200:
             print(f"[attach] native creds refused: {json.dumps(bundle)} -- "
                   f"falling back is manual (re-run without --native).", file=sys.stderr)
@@ -424,7 +440,20 @@ def cmd_who(a) -> int:
         import calendar
         fresh_cutoff = time.time() - 45
         n = 0
+        seen_cards = set()
         for r in sorted(rows, key=lambda r: str(r.get("at") or "")):
+            card = r.get("card") if isinstance(r.get("card"), dict) else None
+            if card and (card.get("name"), card.get("role")) in seen_cards:
+                continue                          # per-connection presence keys duplicate cards
+            if card:
+                seen_cards.add((card.get("name"), card.get("role")))
+            if card and card.get("name") and card.get("kind") != "supervisor":
+                # a COTAL-NATIVE client's presence doc (cotal join / spawn) -- space-wide,
+                # no room field; shown tagged so the roster covers both client kinds.
+                print(f"{'':22}[cotal] {card.get('name')}"
+                      f"{'/' + card['role'] if card.get('role') else ''}")
+                n += 1
+                continue
             if not r.get("name") or not r.get("room"):
                 continue                          # cotal's own daemons heartbeat here too
             if r.get("room") != meta["channel"]:
