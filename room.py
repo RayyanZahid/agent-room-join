@@ -48,8 +48,8 @@ def _sessions_dir() -> Path:
     return d
 
 
-def _inbox_path(room: str) -> Path:
-    return _sessions_dir() / f"{room}.inbox.jsonl"
+def _inbox_path(room: str, role: str) -> Path:
+    return _sessions_dir() / f"{room}.{role}.inbox.jsonl"
 
 
 def _token(token_file: str) -> str:
@@ -111,7 +111,7 @@ async def _publish(broker: str, door: str, room: str, role: str, text: str, toke
 # --- verbs ------------------------------------------------------------------
 def cmd_attach(a) -> int:
     token = _token(a.token_file)
-    inbox = _inbox_path(a.room)
+    inbox = _inbox_path(a.room, a.role)
     res = claim_seat(a.broker, a.room, a.role, token)
     ok = res.get("status") in (200, 202) or (res.get("role_assignments") or {}).get(a.role)
     print(f"[attach] seat '{a.role}': {'yours' if ok else json.dumps(res)}")
@@ -119,17 +119,20 @@ def cmd_attach(a) -> int:
         print("[attach] that seat is held by someone else -- ask the host which seat is yours.",
               file=sys.stderr)
         return 1
-    logf = open(_sessions_dir() / f"{a.room}.listener.log", "a", encoding="utf-8")
-    kw = {}
+    logf = open(_sessions_dir() / f"{a.room}.{a.role}.listener.log", "a", encoding="utf-8")
+    # Fully detach: own process group, no inherited stdin/stdout pipe (else a parent using
+    # command-substitution blocks waiting on the never-exiting listener's inherited fd).
+    kw = {"stdin": subprocess.DEVNULL, "close_fds": True}
     if os.name == "nt":
-        kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP  # type: ignore[attr-defined]
+        DETACHED_PROCESS = 0x00000008
+        kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS  # type: ignore[attr-defined]
     else:
         kw["start_new_session"] = True
     p = subprocess.Popen([sys.executable, str(HERE / "room.py"), "listen",
                           "--room", a.room, "--role", a.role, "--broker", a.broker,
                           "--door", a.door, "--token-file", a.token_file],
                          stdout=logf, stderr=logf, **kw)
-    (_sessions_dir() / f"{a.room}.listener.pid").write_text(str(p.pid))
+    (_sessions_dir() / f"{a.room}.{a.role}.listener.pid").write_text(str(p.pid))
     print(f"[attach] listener running (pid {p.pid}) -> {inbox.name}")
     print(f"[attach] now: `python room.py read --room {a.room}` to see peers, "
           f"`python room.py post --room {a.room} --role {a.role} --text \"...\"` to reply.")
@@ -138,12 +141,12 @@ def cmd_attach(a) -> int:
 
 def cmd_listen(a) -> int:                        # internal -- spawned detached by attach
     asyncio.run(_listen_loop(a.broker, a.door, a.room, a.role, _token(a.token_file),
-                             _inbox_path(a.room)))
+                             _inbox_path(a.room, a.role)))
     return 0
 
 
 def cmd_read(a) -> int:
-    inbox = _inbox_path(a.room)
+    inbox = _inbox_path(a.room, a.role)
     if not inbox.exists():
         print("[read] nothing heard yet (listener just started, or no peer has posted since you attached).")
         return 0
