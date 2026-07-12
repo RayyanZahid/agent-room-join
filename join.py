@@ -39,6 +39,7 @@ TOKEN_PATH = HERE / "sessions" / "ic_agent.json"
 DEFAULT_BROKER = "https://immersivecommons18.tail5da903.ts.net:8443"
 DEFAULT_DOOR = "wss://immersivecommons18.tail5da903.ts.net"
 DEFAULT_ROOM = "room_v4adfdb763mokweq"
+DEFAULT_ROSTER = "ray,david,sven"   # full round-robin turn order (roster[0] opens); no facilitator
 DEFAULT_GOAL = ("Plan the upcoming Immersive Commons hackathon: agree the format, the date, "
                 "the tracks/prizes, and who owns what. Converge on a concrete plan.")
 
@@ -80,8 +81,9 @@ def main(argv=None) -> int:
     ap.add_argument("--model", choices=["claude", "ollama"], default="claude")
     ap.add_argument("--ollama-endpoint", default="http://localhost:11434/v1")
     ap.add_argument("--ollama-model", default="qwen2.5:3b-instruct")
-    ap.add_argument("--facilitator", action="store_true",
-                    help="propose+rebalance the allocation (the host runs this; members don't)")
+    ap.add_argument("--roster", default=DEFAULT_ROSTER,
+                    help="comma-separated full turn order for the round-robin planning discussion")
+    ap.add_argument("--max-turns", type=int, default=3, help="turns each member takes")
     ap.add_argument("--broker", default=DEFAULT_BROKER)
     ap.add_argument("--door", default=DEFAULT_DOOR)
     ap.add_argument("--room", default=DEFAULT_ROOM)
@@ -108,19 +110,20 @@ def main(argv=None) -> int:
         print(f"[join] ERROR claiming seat: {json.dumps(res)}", file=sys.stderr)
         return 1
 
-    caps = args.capabilities or f"{args.role} (no capabilities given -- pass --capabilities)"
-    print(f"[join] launching your agent (model={args.model}) -- it will now talk to the room.\n")
-    import self_org_agent
+    goal = args.goal
+    if args.capabilities:
+        goal = f"{goal}\n(You are '{args.role}'. Your background/strengths: {args.capabilities}.)"
+    print(f"[join] launching your agent (model={args.model}) -- round-robin planning, no facilitator.\n")
+    import mesh_agent
 
     argv2 = ["--broker", args.broker, "--door", args.door, "--room", args.room,
              "--role", args.role, "--token-file", str(TOKEN_PATH),
-             "--capabilities", caps, "--goal", args.goal, "--model", args.model,
+             "--roster", args.roster, "--goal", goal, "--model", args.model,
+             "--max-turns", str(args.max_turns),
              "--overall-timeout", str(args.overall_timeout)]
-    if args.facilitator:
-        argv2.append("--facilitator")
     if args.model == "ollama":
         argv2 += ["--ollama-endpoint", args.ollama_endpoint, "--ollama-model", args.ollama_model]
-    return self_org_agent._main(argv2)
+    return mesh_agent._main(argv2)
 
 
 if __name__ == "__main__":
