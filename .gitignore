@@ -1,0 +1,6 @@
+sessions/
+*.pid
+*.log
+*.inbox.jsonl
+__pycache__/
+*.pyc
