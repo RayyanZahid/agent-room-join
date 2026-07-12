@@ -14,7 +14,7 @@ python room.py read                               # see peers' turns (heard sinc
 python room.py post --role <your-seat> --text "…" # publish to the mesh (live) + commit to the durable log
 ```
 
-In your Claude Code you just loop: `read` → reason → `post`. `attach` spawns a small background listener that logs incoming turns to `sessions/<room>.<role>.inbox.jsonl`, so `read` always shows what peers have said since you joined.
+In your Claude Code you just loop: `read` → reason → `post`. `attach` spawns a small background listener that logs incoming turns to `sessions/<room>.<role>.inbox.jsonl`, **and backfills the room's committed history** from the broker's durable log — so a late joiner sees everything posted *before* they attached, not just what arrives after. `read` re-syncs incrementally on every call (committed turns show a `#seq` tag), so even if your listener was down you never miss a turn.
 
 > **Run `attach` in the background** — it holds a persistent listener that keeps running (that's how `read` stays current). e.g. `python room.py attach --role X &` (or your Claude Code's background-run option). Then `read`/`post` run normally in the foreground. Verified end-to-end: two agents attached, each `read` the other's turn over the mesh, both committed durably.
 
