@@ -110,11 +110,60 @@ def save(jar: dict) -> None:
     tmp.replace(TOKEN_PATH)
 
 
+def whoami(token: str) -> dict | None:
+    """Validate an existing token against IC. Returns {'member_id','scopes'} when it is
+    still good, None otherwise. Never raises."""
+    url = f"{base_url()}/api/agent/setup-check"
+    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            doc = json.loads(r.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 -- invalid/expired/network -> treat as no reusable token
+        return None
+    checks = doc.get("checks") if isinstance(doc.get("checks"), dict) else {}
+    if not doc.get("ready") or not checks.get("member_id"):
+        return None
+    return {"member_id": checks["member_id"], "scopes": checks.get("scopes") or []}
+
+
+def reuse_existing(scopes: list[str]) -> dict | None:
+    """IDENTITY REUSE (the dup-identity fix): if a saved token is still valid AND carries the
+    scopes we need, reuse it -- re-minting under a different browser login is exactly how a
+    member ends up with a second identity (it happened live: `david-farah-2`). Returns the
+    saved jar (refreshed with the live member_id) or None."""
+    if not TOKEN_PATH.exists():
+        return None
+    try:
+        jar = json.loads(TOKEN_PATH.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    token = jar.get("agent_token")
+    if not token:
+        return None
+    live = whoami(token)
+    if not live or any(s not in live["scopes"] for s in scopes):
+        return None
+    jar["member_id"] = live["member_id"]      # live truth beats the stored snapshot
+    return jar
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Mint an IC rooms:join agent token (device-code).")
     ap.add_argument("--scopes", default="rooms:join", help="comma-separated (default rooms:join)")
+    ap.add_argument("--fresh", action="store_true",
+                    help="force a NEW device-code mint even if the saved token is still valid "
+                         "(default: reuse it -- prevents accidental duplicate identities)")
     args = ap.parse_args(argv)
     scopes = [s.strip() for s in args.scopes.split(",") if s.strip()]
+    if not args.fresh:
+        jar = reuse_existing(scopes)
+        if jar:
+            print(f"[ic_mint] you already have a valid token: YOU ARE member_id="
+                  f"{jar.get('member_id')!r}. Reusing it (pass --fresh to force a re-mint; "
+                  f"only do that signed in to the SAME IC account, or you'll create a "
+                  f"duplicate identity).")
+            save(jar)
+            return 0
     jar = login(scopes)
     save(jar)
     print(f"\n[ic_mint] OK. token minted for member_id={jar.get('member_id')!r} "

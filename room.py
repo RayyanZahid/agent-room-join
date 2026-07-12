@@ -41,6 +41,7 @@ from mesh_agent import NatsWsClient, post_turn, WORK_SUBJECT  # noqa: E402
 
 DEFAULT_BROKER = "https://immersivecommons18.tail5da903.ts.net:8443"
 DEFAULT_DOOR = "wss://immersivecommons18.tail5da903.ts.net"
+DEFAULT_NATIVE_DOOR = "wss://immersivecommons18.tail5da903.ts.net/native"
 DEFAULT_ROOM = "room_v4adfdb763mokweq"
 
 
@@ -127,6 +128,138 @@ def backfill(broker: str, room: str, role: str, token: str, inbox: Path, *, quie
     return n
 
 
+# --- NATIVE mode (Cotal 0.11.3): minted creds, push delivery, replay, presence ---------------
+# attach --native trades your IC token for a room-channel-scoped Cotal cred and runs a
+# listener with SERVER-SIDE replay + push delivery: no ready-beacons, no polling, no
+# missed-while-offline. Your live messages are attributed by the broker (you can only publish
+# as yourself) and your listener heartbeats presence so `who` shows who's actually attached.
+def _native_meta_path(room: str, role: str) -> Path:
+    return _sessions_dir() / f"{room}.{role}.native.json"
+
+
+def fetch_native_creds(broker: str, room: str, token: str) -> dict:
+    url = f"{broker.rstrip('/')}/rooms/{room}/native_creds"
+    req = urllib.request.Request(url, data=b"{}", method="POST",
+                                 headers={"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=45) as r:
+            return json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            return {"status": e.code, "reason": f"http_{e.code}"}
+
+
+def _save_native_meta(room: str, role: str, bundle: dict) -> Path:
+    p = _native_meta_path(room, role)
+    p.write_text(json.dumps(bundle), encoding="utf-8")
+    try:
+        os.chmod(p, 0o600)                    # the bundle holds your private cred seed
+    except OSError:
+        pass
+    return p
+
+
+def _load_native_meta(room: str, role: str) -> dict:
+    return json.loads(_native_meta_path(room, role).read_text(encoding="utf-8"))
+
+
+def _inbox_seen(inbox: Path) -> tuple[int, set]:
+    """Resume state from the local inbox: (max stream seq, seen chat-message ids)."""
+    max_sseq, seen = 0, set()
+    if inbox.exists():
+        for line in inbox.read_text(encoding="utf-8").splitlines():
+            try:
+                m = json.loads(line)
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(m, dict):
+                if isinstance(m.get("sseq"), int):
+                    max_sseq = max(max_sseq, m["sseq"])
+                if m.get("mid"):
+                    seen.add(m["mid"])
+    return max_sseq, seen
+
+
+async def _native_listen_loop(room: str, role: str, door_native: str, inbox: Path):
+    """Supervised listener: connect -> bind our replay/push consumer (resume from the last
+    stream seq we recorded) -> heartbeat presence -> append every peer turn as it is PUSHED.
+    Reconnects with backoff forever (no hard overall-timeout; kill the process to stop)."""
+    from native_client import NativeClient, ack_stream_seq
+    meta = _load_native_meta(room, role)
+    space, channel, member = meta["space"], meta["channel"], meta.get("member_id", role)
+    backoff = 1.0
+    while True:
+        client = NativeClient(door_native, meta["creds"], name=f"{role}@{room[:12]}")
+        try:
+            await client.connect()
+            print(f"[native] connected as {role} (member {member})", flush=True)
+            backoff = 1.0
+            max_sseq, seen = _inbox_seen(inbox)
+            deliver = f"{client.inbox_prefix}.push"
+            _sid, q = await client.subscribe(deliver)
+            await client.ensure_chat_consumer(
+                space=space, channel=channel, deliver_subject=deliver,
+                start_seq=(max_sseq + 1) if max_sseq else None)
+            print(f"[native] replay/push consumer bound "
+                  f"({'resume from ' + str(max_sseq + 1) if max_sseq else 'full history'})",
+                  flush=True)
+
+            async def heartbeat():
+                while True:
+                    try:
+                        await client.presence_put(space=space, doc={
+                            "name": role, "member": member, "room": channel,
+                            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
+                    except Exception:  # noqa: BLE001
+                        return                     # socket died; outer loop reconnects
+                    await asyncio.sleep(10)
+
+            hb = asyncio.create_task(heartbeat())
+            try:
+                while True:
+                    ev = await q.get()             # ("msg", subject, sid, reply, payload)
+                    if ev[0] == "closed":
+                        raise ConnectionError("mesh socket closed")   # -> outer reconnect
+                    subject, reply, payload = ev[1], ev[3], ev[4]
+                    toks = subject.split(".")
+                    sender_nkey = toks[4] if len(toks) >= 6 else ""
+                    if sender_nkey == client.nkey:
+                        continue                   # my own turn: I know what I said
+                    try:
+                        m = json.loads(payload.decode("utf-8", "replace"))
+                    except ValueError:
+                        continue
+                    mid = m.get("id")
+                    if mid and mid in seen:
+                        continue                   # replay overlap -> exactly-once locally
+                    if mid:
+                        seen.add(mid)
+                    sseq = ack_stream_seq(reply)
+                    row = {"role": (m.get("from") or {}).get("name") or sender_nkey[-8:],
+                           "text": m.get("text"),
+                           "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                           "mid": mid}
+                    if sseq:
+                        row["sseq"] = sseq
+                    with open(inbox, "a", encoding="utf-8") as f:
+                        f.write(json.dumps(row) + "\n")
+            finally:
+                hb.cancel()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[native] connection lost ({type(exc).__name__}: {exc}); "
+                  f"reconnecting in {backoff:.0f}s", flush=True)
+        finally:
+            try:
+                await client.close()
+            except Exception:  # noqa: BLE001
+                pass
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 30.0)
+
+
 # --- the background listener: mesh -> local inbox file ----------------------
 async def _listen_loop(broker: str, door: str, room: str, role: str, token: str, inbox: Path):
     grant = mesh_attach.fetch_grant(broker, room, token)
@@ -173,6 +306,15 @@ def cmd_attach(a) -> int:
         print("[attach] that seat is held by someone else -- ask the host which seat is yours.",
               file=sys.stderr)
         return 1
+    if a.native:
+        bundle = fetch_native_creds(a.broker, a.room, token)
+        if bundle.get("status") != 200:
+            print(f"[attach] native creds refused: {json.dumps(bundle)} -- "
+                  f"falling back is manual (re-run without --native).", file=sys.stderr)
+            return 1
+        _save_native_meta(a.room, a.role, bundle)
+        print(f"[attach] native cred minted (member {bundle.get('member_id')}, "
+              f"channel {bundle.get('channel')}) -- replay + push + presence enabled.")
     logf = open(_sessions_dir() / f"{a.room}.{a.role}.listener.log", "a", encoding="utf-8")
     # Fully detach: own process group, no inherited stdin/stdout pipe (else a parent using
     # command-substitution blocks waiting on the never-exiting listener's inherited fd).
@@ -182,23 +324,30 @@ def cmd_attach(a) -> int:
         kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS  # type: ignore[attr-defined]
     else:
         kw["start_new_session"] = True
-    p = subprocess.Popen([sys.executable, str(HERE / "room.py"), "listen",
-                          "--room", a.room, "--role", a.role, "--broker", a.broker,
-                          "--door", a.door, "--token-file", a.token_file],
-                         stdout=logf, stderr=logf, **kw)
+    argv = [sys.executable, str(HERE / "room.py"), "listen",
+            "--room", a.room, "--role", a.role, "--broker", a.broker,
+            "--door", a.door, "--door-native", a.door_native, "--token-file", a.token_file]
+    if a.native:
+        argv.append("--native")
+    p = subprocess.Popen(argv, stdout=logf, stderr=logf, **kw)
     (_sessions_dir() / f"{a.room}.{a.role}.listener.pid").write_text(str(p.pid))
     print(f"[attach] listener running (pid {p.pid}) -> {inbox.name}")
-    # LATE-JOIN CATCH-UP: pull everything committed before you attached. (read re-backfills
-    # incrementally, so any turn landing in the subscribe race-window is healed on next read.)
-    got = backfill(a.broker, a.room, a.role, token, inbox)
-    if got:
-        print(f"[attach] backfilled {got} committed turn(s) from before you attached -- `read` has them.")
+    if not a.native:
+        # LATE-JOIN CATCH-UP (grant path): pull everything committed before you attached.
+        # (Native mode needs no backfill call here -- the listener REPLAYS server-side.)
+        got = backfill(a.broker, a.room, a.role, token, inbox)
+        if got:
+            print(f"[attach] backfilled {got} committed turn(s) from before you attached -- `read` has them.")
     print(f"[attach] now: `python room.py read --room {a.room}` to see peers, "
           f"`python room.py post --room {a.room} --role {a.role} --text \"...\"` to reply.")
     return 0
 
 
 def cmd_listen(a) -> int:                        # internal -- spawned detached by attach
+    if a.native:
+        asyncio.run(_native_listen_loop(a.room, a.role, a.door_native,
+                                        _inbox_path(a.room, a.role)))
+        return 0
     asyncio.run(_listen_loop(a.broker, a.door, a.room, a.role, _token(a.token_file),
                              _inbox_path(a.room, a.role)))
     return 0
@@ -240,26 +389,80 @@ def cmd_read(a) -> int:
 
 def cmd_post(a) -> int:
     token = _token(a.token_file)
-    asyncio.run(_publish(a.broker, a.door, a.room, a.role, a.text, token))   # live to peers
+    if a.native:
+        async def _np():
+            from native_client import NativeClient
+            meta = _load_native_meta(a.room, a.role)
+            client = NativeClient(a.door_native, meta["creds"], name=f"{a.role}-post")
+            await client.connect()
+            try:
+                # publish_chat PING/PONG-flushes: the server has the message before we exit
+                # (JetStream persists it durably -- peers replay it even if offline right now).
+                await client.publish_chat(space=meta["space"], channel=meta["channel"],
+                                          text=a.text, sender=a.role)
+            finally:
+                await client.close()
+        asyncio.run(_np())
+    else:
+        asyncio.run(_publish(a.broker, a.door, a.room, a.role, a.text, token))  # live to peers
     verdict = post_turn(a.broker, a.room, a.role, a.text, token)             # durable commit
-    print(f"[post] published to mesh + committed: {json.dumps(verdict)}")
+    print(f"[post] published ({'native' if a.native else 'mesh'}) + committed: {json.dumps(verdict)}")
     return 0 if verdict.get("status") in (200, 202) else 1
 
 
+def cmd_who(a) -> int:
+    """Live presence roster (native): who is actually attached to this room right now."""
+    async def _who():
+        from native_client import NativeClient
+        meta = _load_native_meta(a.room, a.role)
+        client = NativeClient(a.door_native, meta["creds"], name=f"{a.role}-who")
+        await client.connect()
+        try:
+            rows = await client.presence_snapshot(space=meta["space"])
+        finally:
+            await client.close()
+        import calendar
+        fresh_cutoff = time.time() - 45
+        n = 0
+        for r in sorted(rows, key=lambda r: str(r.get("at") or "")):
+            if not r.get("name") or not r.get("room"):
+                continue                          # cotal's own daemons heartbeat here too
+            if r.get("room") != meta["channel"]:
+                continue                          # presence is space-wide; show this room only
+            try:                                  # timegm: the timestamp is UTC (mktime is not)
+                at = calendar.timegm(time.strptime(r.get("at", ""), "%Y-%m-%dT%H:%M:%SZ"))
+            except Exception:  # noqa: BLE001
+                at = 0
+            live = "LIVE" if at >= fresh_cutoff else "stale"
+            print(f"{r.get('at','')}  [{live}] {r.get('name')} (member {r.get('member')})")
+            n += 1
+        if not n:
+            print("[who] nobody is heartbeating presence in this room right now.")
+    asyncio.run(_who())
+    return 0
+
+
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(description="Live-session client for an IC agent-room (attach/read/post).")
+    ap = argparse.ArgumentParser(description="Live-session client for an IC agent-room "
+                                             "(attach/read/post/who; --native = Cotal 0.11.3 "
+                                             "replay + push + presence).")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("attach", "listen", "read", "post"):
+    for name in ("attach", "listen", "read", "post", "who"):
         sp = sub.add_parser(name)
         sp.add_argument("--room", default=DEFAULT_ROOM)
         sp.add_argument("--role", default="ray")
         sp.add_argument("--broker", default=DEFAULT_BROKER)
         sp.add_argument("--door", default=DEFAULT_DOOR)
+        sp.add_argument("--door-native", default=DEFAULT_NATIVE_DOOR)
         sp.add_argument("--token-file", default=str(HERE / "sessions" / "ic_agent.json"))
+        sp.add_argument("--native", action="store_true",
+                        help="use the Cotal-native mesh (minted creds: server-side replay, "
+                             "push delivery, presence, attributed publishes)")
         if name == "post":
             sp.add_argument("--text", required=True)
     a = ap.parse_args(argv)
-    return {"attach": cmd_attach, "listen": cmd_listen, "read": cmd_read, "post": cmd_post}[a.cmd](a)
+    return {"attach": cmd_attach, "listen": cmd_listen, "read": cmd_read,
+            "post": cmd_post, "who": cmd_who}[a.cmd](a)
 
 
 if __name__ == "__main__":
