@@ -426,6 +426,44 @@ def cmd_post(a) -> int:
     return 0 if verdict.get("status") in (200, 202) else 1
 
 
+def cmd_leave(a) -> int:
+    """Release your seat so another member can claim it (the room stays live)."""
+    token = _token(a.token_file)
+    url = f"{a.broker.rstrip('/')}/rooms/{a.room}/leave"
+    body = json.dumps({"role": a.role}).encode()
+    req = urllib.request.Request(url, data=body, method="POST",
+                                 headers={"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            res = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            res = json.loads(e.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            res = {"status": e.code}
+    ok = res.get("status") == 200
+    print(f"[leave] seat '{a.role}': {'released' if ok else json.dumps(res)}")
+    # stop the local listener + drop the native cred meta (we no longer hold the seat)
+    pidf = _sessions_dir() / f"{a.room}.{a.role}.listener.pid"
+    if pidf.exists():
+        try:
+            pid = int(pidf.read_text().strip())
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                               capture_output=True)
+            else:
+                os.kill(pid, 15)
+            print(f"[leave] stopped local listener (pid {pid})")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            pidf.unlink()
+        except OSError:
+            pass
+    return 0 if ok else 1
+
+
 def cmd_who(a) -> int:
     """Live presence roster (native): who is actually attached to this room right now."""
     async def _who():
@@ -449,8 +487,11 @@ def cmd_who(a) -> int:
                 seen_cards.add((card.get("name"), card.get("role")))
             if card and card.get("name") and card.get("kind") != "supervisor":
                 # a COTAL-NATIVE client's presence doc (cotal join / spawn) -- space-wide,
-                # no room field; shown tagged so the roster covers both client kinds.
-                print(f"{'':22}[cotal] {card.get('name')}"
+                # no room field; shown tagged so the roster covers both client kinds. cotal's
+                # presence carries `status` (online/idle/offline) rather than our timestamp.
+                st = r.get("status") or card.get("status") or ""
+                tag = f" [{st}]" if st else ""
+                print(f"{'':22}[cotal]{tag} {card.get('name')}"
                       f"{'/' + card['role'] if card.get('role') else ''}")
                 n += 1
                 continue
@@ -476,7 +517,7 @@ def main(argv=None) -> int:
                                              "(attach/read/post/who; --native = Cotal 0.11.3 "
                                              "replay + push + presence).")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("attach", "listen", "read", "post", "who"):
+    for name in ("attach", "listen", "read", "post", "who", "leave"):
         sp = sub.add_parser(name)
         sp.add_argument("--room", default=DEFAULT_ROOM)
         sp.add_argument("--role", default="ray")
@@ -491,7 +532,7 @@ def main(argv=None) -> int:
             sp.add_argument("--text", required=True)
     a = ap.parse_args(argv)
     return {"attach": cmd_attach, "listen": cmd_listen, "read": cmd_read,
-            "post": cmd_post, "who": cmd_who}[a.cmd](a)
+            "post": cmd_post, "who": cmd_who, "leave": cmd_leave}[a.cmd](a)
 
 
 if __name__ == "__main__":

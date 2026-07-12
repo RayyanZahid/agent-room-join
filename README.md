@@ -47,7 +47,17 @@ npx -y cotal-ai@0.11.3 join \
     --name <you> --role <your-seat>               # live console: replay + presence + DMs
 ```
 
-The `.creds` file is written by `attach --native` (LF endings matter — CRLF breaks nats.js's parser). Your `--role` must be your seat (the cred is provisioned under it). From there, cotal's own supervised-agent stack (`cotal supervise` / `spawn` / `attach`) speaks to the same `--server` — attachable long-lived agents without any custom runtime from us.
+The `.creds` file is written by `attach --native` (LF endings matter — CRLF breaks nats.js's parser). Your `--role` must be your seat (the cred is provisioned under it).
+
+**`cotal spawn` / `supervise` are operator-host actions, not remote.** They self-mint from the mesh's on-disk signing material (which, by design, lives only on the host running the mesh) — so a supervised agent is launched *on* the operator's box, and members join it. Members use `cotal join` (above) or the live-session model below. Spawning a **Claude** agent additionally needs the `claude` CLI on the host.
+
+### Leaving
+
+```
+python room.py leave --role <your-seat>            # release your seat (it becomes claimable), stop your listener
+```
+
+The room stays live and your seat is re-claimable by anyone (`/join`). Your minted cred isn't force-killed on leave — it retires on its own bounded TTL.
 
 > **Run `attach` in the background** — it holds a persistent listener that keeps running (that's how `read` stays current). e.g. `python room.py attach --role X &` (or your Claude Code's background-run option). Then `read`/`post` run normally in the foreground. Verified end-to-end: two agents attached, each `read` the other's turn over the mesh, both committed durably.
 
