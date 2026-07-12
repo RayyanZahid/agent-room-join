@@ -426,6 +426,88 @@ def cmd_post(a) -> int:
     return 0 if verdict.get("status") in (200, 202) else 1
 
 
+def cmd_create(a) -> int:
+    """Open a NEW room (self-service): declare seats, assign yourself + optionally invite
+    others. Prints the room_id others join with. --roles a,b,c --assign a:<me>,b:<friend>."""
+    token = _token(a.token_file)
+    who = _member_id_of(a.token_file)
+    roles = [r.strip() for r in (a.roles or "").split(",") if r.strip()]
+    if not roles:
+        print("[create] pass --roles a,b,c", file=sys.stderr)
+        return 1
+    assign = {}
+    for pair in (a.assign or "").split(","):
+        if ":" in pair:
+            role, mem = pair.split(":", 1)
+            assign[role.strip()] = mem.strip()
+    # default: you take the first seat if you didn't assign yourself anywhere
+    if who and who not in assign.values():
+        assign[roles[0]] = who
+    url = f"{a.broker.rstrip('/')}/rooms"
+    body = json.dumps({"roles": roles, "role_assignments": assign,
+                       "turn_timeout_s": a.turn_timeout}).encode()
+    req = urllib.request.Request(url, data=body, method="POST",
+                                 headers={"Authorization": f"Bearer {token}",
+                                          "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            res = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        try:
+            res = json.loads(e.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001
+            res = {"status": e.code}
+    if res.get("status") != 201:
+        print(f"[create] failed: {json.dumps(res)}", file=sys.stderr)
+        return 1
+    rid = res["room_id"]
+    print(f"[create] room OPEN: {rid}")
+    print(f"[create] seats: {json.dumps(res['role_assignments'])}")
+    open_seats = [r for r in res["roles"] if r not in res["role_assignments"]]
+    if open_seats:
+        print(f"[create] open seats for others: {', '.join(open_seats)}")
+    print(f"[create] you're in. Attach: python room.py attach --native --room {rid} "
+          f"--role {[k for k,v in res['role_assignments'].items() if v==who][0] if who else roles[0]}")
+    print(f"[create] others join: python room.py attach --native --room {rid} --role <seat>")
+    return 0
+
+
+def cmd_rooms(a) -> int:
+    """Discover live rooms you can see: which seats are open, who's in, which are yours."""
+    token = _token(a.token_file)
+    req = urllib.request.Request(f"{a.broker.rstrip('/')}/rooms",
+                                 headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            res = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        print(f"[rooms] error {e.code}", file=sys.stderr)
+        return 1
+    rooms = res.get("rooms", [])
+    if not rooms:
+        print("[rooms] no live rooms right now.")
+        return 0
+    for room in rooms:
+        mark = "* " if room.get("mine") else "  "
+        seats = ", ".join(room["roles"])
+        opens = ", ".join(room["open_seats"]) or "(none)"
+        print(f"{mark}{room['room_id']}  seats[{seats}]  open[{opens}]  "
+              f"members[{', '.join(room['members'])}]")
+    print("  (* = you're in it)")
+    return 0
+
+
+def _member_id_of(token_file: str) -> str:
+    """Your member_id, read from the token jar (ic_mint writes it). Best-effort: the create
+    endpoint enforces creator-membership server-side, so a wrong/empty value just means you
+    must name your own seat in --assign explicitly."""
+    try:
+        jar = json.load(open(token_file, encoding="utf-8"))
+        return jar.get("member_id") or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def cmd_leave(a) -> int:
     """Release your seat so another member can claim it (the room stays live)."""
     token = _token(a.token_file)
@@ -517,7 +599,7 @@ def main(argv=None) -> int:
                                              "(attach/read/post/who; --native = Cotal 0.11.3 "
                                              "replay + push + presence).")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("attach", "listen", "read", "post", "who", "leave"):
+    for name in ("attach", "listen", "read", "post", "who", "leave", "create", "rooms"):
         sp = sub.add_parser(name)
         sp.add_argument("--room", default=DEFAULT_ROOM)
         sp.add_argument("--role", default="ray")
@@ -530,9 +612,14 @@ def main(argv=None) -> int:
                              "push delivery, presence, attributed publishes)")
         if name == "post":
             sp.add_argument("--text", required=True)
+        if name == "create":
+            sp.add_argument("--roles", required=True, help="comma-separated seats, e.g. coder,tester")
+            sp.add_argument("--assign", default="", help="role:member,role:member (invite others)")
+            sp.add_argument("--turn-timeout", type=float, default=7200.0)
     a = ap.parse_args(argv)
     return {"attach": cmd_attach, "listen": cmd_listen, "read": cmd_read,
-            "post": cmd_post, "who": cmd_who, "leave": cmd_leave}[a.cmd](a)
+            "post": cmd_post, "who": cmd_who, "leave": cmd_leave,
+            "create": cmd_create, "rooms": cmd_rooms}[a.cmd](a)
 
 
 if __name__ == "__main__":
