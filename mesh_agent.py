@@ -192,10 +192,15 @@ def ollama_agent_fn(endpoint: str, model: str):
 # coordination commit: POST /rooms/<id>/turn
 # ---------------------------------------------------------------------------
 def post_turn(broker_base: str, room: str, role: str, content: str, token: str,
-              *, timeout: float = 10.0) -> dict:
-    """Commit one turn to the broker (the gated source of truth). Returns the verdict dict."""
+              *, channel: str = None, timeout: float = 10.0) -> dict:
+    """Commit one turn to the broker (the gated source of truth). Returns the verdict dict.
+    `channel` (multi-channel rooms, optional) tags the turn; omitted -> the broker's own
+    "general" default, so an existing caller that never passes channel= is unaffected."""
     url = f"{broker_base.rstrip('/')}/rooms/{room}/turn"
-    body = json.dumps({"role": role, "content": content}).encode()
+    payload = {"role": role, "content": content}
+    if channel:
+        payload["channel"] = channel
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Authorization": f"Bearer {token}",
                                           "Content-Type": "application/json"})

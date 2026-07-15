@@ -55,6 +55,9 @@ def _inbox_path(room: str, role: str) -> Path:
     return _sessions_dir() / f"{room}.{role}.inbox.jsonl"
 
 
+DEFAULT_CHANNEL = "general"  # matches the broker's own default (COTAL-CHANNELS P1)
+
+
 def _token(token_file: str) -> str:
     return json.load(open(token_file, encoding="utf-8"))["agent_token"]
 
@@ -100,7 +103,13 @@ def fetch_turns(broker: str, room: str, token: str, since: int = 0) -> dict:
 def backfill(broker: str, room: str, role: str, token: str, inbox: Path, *, quiet=False) -> int:
     """Append every committed turn since the cursor to the local inbox (peers only, matching
     the live listener). Returns how many landed. Graceful: an older broker without the turns
-    endpoint (404) just means live-only, never an error."""
+    endpoint (404) just means live-only, never an error.
+
+    ALWAYS fetches every channel (no server-side ?channel= filter) -- one shared cursor + one
+    shared local inbox, each row tagged with its channel (P1). `read --channel` filters at
+    PRINT time, so a single backfill/cursor never has to choose which channel "owns" the
+    since-pointer (server-side filtering would still advance the GLOBAL cursor per read_turns'
+    contract, so filtering here would silently skip rows on a later differently-filtered call)."""
     sp = _since_path(room, role)
     try:
         since = max(0, int(sp.read_text(encoding="utf-8").strip()))
@@ -119,7 +128,8 @@ def backfill(broker: str, room: str, role: str, token: str, inbox: Path, *, quie
             if not isinstance(t, dict) or t.get("role") == role:
                 continue                          # my own turns: I already know what I said
             f.write(json.dumps({"role": t.get("role"), "text": t.get("content"),
-                                "at": t.get("at"), "seq": t.get("seq")}) + "\n")
+                                "at": t.get("at"), "seq": t.get("seq"),
+                                "channel": t.get("channel") or DEFAULT_CHANNEL}) + "\n")
             n += 1
     try:
         sp.write_text(str(int(res.get("next_since", since))), encoding="utf-8")
@@ -133,8 +143,19 @@ def backfill(broker: str, room: str, role: str, token: str, inbox: Path, *, quie
 # listener with SERVER-SIDE replay + push delivery: no ready-beacons, no polling, no
 # missed-while-offline. Your live messages are attributed by the broker (you can only publish
 # as yourself) and your listener heartbeats presence so `who` shows who's actually attached.
-def _native_meta_path(room: str, role: str) -> Path:
-    return _sessions_dir() / f"{room}.{role}.native.json"
+def _channel_suffix(channel: str = None) -> str:
+    """"" for the default channel (byte-identical legacy filenames), ".<channel>" otherwise --
+    so attaching to a SECOND channel never collides with (or silently reuses) the general
+    listener's meta/creds/pid files. Each channel gets its OWN minted cred (own NKEY), which
+    matters live: Cotal pins the replay consumer name to the cred's NKEY, so one cred can only
+    ever be bound to ONE channel's filter at a time -- true concurrent multi-channel replay
+    needs N distinct creds, not one cred subscribing N subjects (verified live 2026-07-15)."""
+    channel = channel or DEFAULT_CHANNEL
+    return "" if channel == DEFAULT_CHANNEL else f".{channel}"
+
+
+def _native_meta_path(room: str, role: str, channel: str = None) -> Path:
+    return _sessions_dir() / f"{room}.{role}{_channel_suffix(channel)}.native.json"
 
 
 def fetch_native_creds(broker: str, room: str, token: str, role: str = "") -> dict:
@@ -153,8 +174,8 @@ def fetch_native_creds(broker: str, room: str, token: str, role: str = "") -> di
             return {"status": e.code, "reason": f"http_{e.code}"}
 
 
-def _save_native_meta(room: str, role: str, bundle: dict) -> Path:
-    p = _native_meta_path(room, role)
+def _save_native_meta(room: str, role: str, bundle: dict, channel: str = None) -> Path:
+    p = _native_meta_path(room, role, channel)
     p.write_text(json.dumps(bundle), encoding="utf-8")
     try:
         os.chmod(p, 0o600)                    # the bundle holds your private cred seed
@@ -163,7 +184,7 @@ def _save_native_meta(room: str, role: str, bundle: dict) -> Path:
     # ALSO emit a standard .creds file for nats-native tools (the cotal CLI, nats CLI, any
     # NATS client) -- with LF endings FORCED: a Windows text-mode write turns them into CRLF,
     # which nats.js's creds parser rejects ("unable to parse credentials"; cost us live time).
-    cp = _sessions_dir() / f"{room}.{role}.creds"
+    cp = _sessions_dir() / f"{room}.{role}{_channel_suffix(channel)}.creds"
     with open(cp, "w", encoding="utf-8", newline="\n") as f:
         f.write(bundle["creds"])
     try:
@@ -173,8 +194,8 @@ def _save_native_meta(room: str, role: str, bundle: dict) -> Path:
     return p
 
 
-def _load_native_meta(room: str, role: str) -> dict:
-    return json.loads(_native_meta_path(room, role).read_text(encoding="utf-8"))
+def _load_native_meta(room: str, role: str, channel: str = None) -> dict:
+    return json.loads(_native_meta_path(room, role, channel).read_text(encoding="utf-8"))
 
 
 def _inbox_seen(inbox: Path) -> tuple[int, set]:
@@ -194,25 +215,37 @@ def _inbox_seen(inbox: Path) -> tuple[int, set]:
     return max_sseq, seen
 
 
-async def _native_listen_loop(room: str, role: str, door_native: str, inbox: Path):
+async def _native_listen_loop(room: str, role: str, door_native: str, inbox: Path,
+                              channel_name: str = None):
     """Supervised listener: connect -> bind our replay/push consumer (resume from the last
     stream seq we recorded) -> heartbeat presence -> append every peer turn as it is PUSHED.
-    Reconnects with backoff forever (no hard overall-timeout; kill the process to stop)."""
+    Reconnects with backoff forever (no hard overall-timeout; kill the process to stop).
+
+    `channel_name` (P1, e.g. "judges") selects WHICH of the cred's allowed channels this one
+    listener binds to -- default DEFAULT_CHANNEL ("general"), the legacy single-channel shape.
+    ONE listener binds ONE channel: Cotal's replay consumer name is pinned to the cred's NKEY,
+    so a single connection cannot multiplex several channels' consumers simultaneously -- that
+    needs N distinct minted creds (attach --channel again mints a fresh one; see
+    _channel_suffix's docstring)."""
     from native_client import NativeClient, ack_stream_seq
-    meta = _load_native_meta(room, role)
-    space, channel, member = meta["space"], meta["channel"], meta.get("member_id", role)
+    meta = _load_native_meta(room, role, channel_name)
+    channel_name = channel_name or DEFAULT_CHANNEL
+    space = meta["space"]
+    chan_subject = (meta.get("channels") or {}).get(channel_name) or meta["channel"]
+    member = meta.get("member_id", role)
     backoff = 1.0
     while True:
         client = NativeClient(door_native, meta["creds"], name=f"{role}@{room[:12]}")
         try:
             await client.connect()
-            print(f"[native] connected as {role} (member {member})", flush=True)
+            print(f"[native] connected as {role} (member {member}, channel {channel_name})",
+                  flush=True)
             backoff = 1.0
             max_sseq, seen = _inbox_seen(inbox)
             deliver = f"{client.inbox_prefix}.push"
             _sid, q = await client.subscribe(deliver)
             await client.ensure_chat_consumer(
-                space=space, channel=channel, deliver_subject=deliver,
+                space=space, channel=chan_subject, deliver_subject=deliver,
                 start_seq=(max_sseq + 1) if max_sseq else None)
             print(f"[native] replay/push consumer bound "
                   f"({'resume from ' + str(max_sseq + 1) if max_sseq else 'full history'})",
@@ -222,7 +255,7 @@ async def _native_listen_loop(room: str, role: str, door_native: str, inbox: Pat
                 while True:
                     try:
                         await client.presence_put(space=space, doc={
-                            "name": role, "member": member, "room": channel,
+                            "name": role, "member": member, "room": chan_subject,
                             "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
                     except Exception:  # noqa: BLE001
                         return                     # socket died; outer loop reconnects
@@ -257,7 +290,7 @@ async def _native_listen_loop(room: str, role: str, door_native: str, inbox: Pat
                     row = {"role": (m.get("from") or {}).get("name") or sender_nkey[-8:],
                            "text": text,
                            "at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                           "mid": mid}
+                           "mid": mid, "channel": channel_name}
                     if sseq:
                         row["sseq"] = sseq
                     with open(inbox, "a", encoding="utf-8") as f:
@@ -322,16 +355,22 @@ def cmd_attach(a) -> int:
         print("[attach] that seat is held by someone else -- ask the host which seat is yours.",
               file=sys.stderr)
         return 1
+    channel = getattr(a, "channel", None) or DEFAULT_CHANNEL
     if a.native:
         bundle = fetch_native_creds(a.broker, a.room, token, role=a.role)
         if bundle.get("status") != 200:
             print(f"[attach] native creds refused: {json.dumps(bundle)} -- "
                   f"falling back is manual (re-run without --native).", file=sys.stderr)
             return 1
-        _save_native_meta(a.room, a.role, bundle)
+        if channel != DEFAULT_CHANNEL and channel not in (bundle.get("channels") or {}):
+            print(f"[attach] room has no channel {channel!r} -- declared: "
+                  f"{list((bundle.get('channels') or {}).keys())}", file=sys.stderr)
+            return 1
+        _save_native_meta(a.room, a.role, bundle, channel)
         print(f"[attach] native cred minted (member {bundle.get('member_id')}, "
-              f"channel {bundle.get('channel')}) -- replay + push + presence enabled.")
-    logf = open(_sessions_dir() / f"{a.room}.{a.role}.listener.log", "a", encoding="utf-8")
+              f"channel {channel}) -- replay + push + presence enabled.")
+    logf = open(_sessions_dir() / f"{a.room}.{a.role}{_channel_suffix(channel)}.listener.log",
+               "a", encoding="utf-8")
     # Fully detach: own process group, no inherited stdin/stdout pipe (else a parent using
     # command-substitution blocks waiting on the never-exiting listener's inherited fd).
     kw = {"stdin": subprocess.DEVNULL, "close_fds": True}
@@ -342,11 +381,13 @@ def cmd_attach(a) -> int:
         kw["start_new_session"] = True
     argv = [sys.executable, str(HERE / "room.py"), "listen",
             "--room", a.room, "--role", a.role, "--broker", a.broker,
-            "--door", a.door, "--door-native", a.door_native, "--token-file", a.token_file]
+            "--door", a.door, "--door-native", a.door_native, "--token-file", a.token_file,
+            "--channel", channel]
     if a.native:
         argv.append("--native")
     p = subprocess.Popen(argv, stdout=logf, stderr=logf, **kw)
-    (_sessions_dir() / f"{a.room}.{a.role}.listener.pid").write_text(str(p.pid))
+    (_sessions_dir() / f"{a.room}.{a.role}{_channel_suffix(channel)}.listener.pid").write_text(
+        str(p.pid))
     print(f"[attach] listener running (pid {p.pid}) -> {inbox.name}")
     if not a.native:
         # LATE-JOIN CATCH-UP (grant path): pull everything committed before you attached.
@@ -360,9 +401,10 @@ def cmd_attach(a) -> int:
 
 
 def cmd_listen(a) -> int:                        # internal -- spawned detached by attach
+    channel = getattr(a, "channel", None) or DEFAULT_CHANNEL
     if a.native:
         asyncio.run(_native_listen_loop(a.room, a.role, a.door_native,
-                                        _inbox_path(a.room, a.role)))
+                                        _inbox_path(a.room, a.role), channel))
         return 0
     asyncio.run(_listen_loop(a.broker, a.door, a.room, a.role, _token(a.token_file),
                              _inbox_path(a.room, a.role)))
@@ -371,8 +413,10 @@ def cmd_listen(a) -> int:                        # internal -- spawned detached 
 
 def cmd_read(a) -> int:
     inbox = _inbox_path(a.room, a.role)
+    channel = getattr(a, "channel", None) or DEFAULT_CHANNEL
     # incremental catch-up first: anything committed that neither the listener nor a prior
     # backfill saw (e.g. posted in the attach race-window, or while your listener was down).
+    # Always full-room (every channel) -- see backfill()'s docstring; filtering happens below.
     try:
         backfill(a.broker, a.room, a.role, _token(a.token_file), inbox, quiet=True)
     except Exception:  # noqa: BLE001 -- read must still show local history with no token/network
@@ -386,7 +430,7 @@ def cmd_read(a) -> int:
             m = json.loads(line)
         except Exception:  # noqa: BLE001
             continue
-        if isinstance(m, dict):
+        if isinstance(m, dict) and (m.get("channel") or DEFAULT_CHANNEL) == channel:
             rows.append(m)
     # dedupe live-vs-committed: a committed row (has seq) is authoritative; drop a live-heard
     # duplicate (no seq) with the same (role, text). Then present in timestamp order.
@@ -405,23 +449,28 @@ def cmd_read(a) -> int:
 
 def cmd_post(a) -> int:
     token = _token(a.token_file)
+    channel = getattr(a, "channel", None) or DEFAULT_CHANNEL
     if a.native:
         async def _np():
             from native_client import NativeClient
+            # publish is stateless (no pinned consumer involved) -- the "general" mint already
+            # carries publish rights to EVERY declared channel (server mints them all), so no
+            # channel-specific attach is required just to post to a non-default channel.
             meta = _load_native_meta(a.room, a.role)
+            subject = (meta.get("channels") or {}).get(channel) or meta["channel"]
             client = NativeClient(a.door_native, meta["creds"], name=f"{a.role}-post")
             await client.connect()
             try:
                 # publish_chat PING/PONG-flushes: the server has the message before we exit
                 # (JetStream persists it durably -- peers replay it even if offline right now).
-                await client.publish_chat(space=meta["space"], channel=meta["channel"],
+                await client.publish_chat(space=meta["space"], channel=subject,
                                           text=a.text, sender=a.role)
             finally:
                 await client.close()
         asyncio.run(_np())
     else:
         asyncio.run(_publish(a.broker, a.door, a.room, a.role, a.text, token))  # live to peers
-    verdict = post_turn(a.broker, a.room, a.role, a.text, token)             # durable commit
+    verdict = post_turn(a.broker, a.room, a.role, a.text, token, channel=channel)  # durable commit
     print(f"[post] published ({'native' if a.native else 'mesh'}) + committed: {json.dumps(verdict)}")
     return 0 if verdict.get("status") in (200, 202) else 1
 
@@ -443,9 +492,12 @@ def cmd_create(a) -> int:
     # default: you take the first seat if you didn't assign yourself anywhere
     if who and who not in assign.values():
         assign[roles[0]] = who
+    channels = [c.strip() for c in (getattr(a, "channels", "") or "").split(",") if c.strip()]
     url = f"{a.broker.rstrip('/')}/rooms"
-    body = json.dumps({"roles": roles, "role_assignments": assign,
-                       "turn_timeout_s": a.turn_timeout}).encode()
+    body_dict = {"roles": roles, "role_assignments": assign, "turn_timeout_s": a.turn_timeout}
+    if channels:
+        body_dict["channels"] = channels
+    body = json.dumps(body_dict).encode()
     req = urllib.request.Request(url, data=body, method="POST",
                                  headers={"Authorization": f"Bearer {token}",
                                           "Content-Type": "application/json"})
@@ -463,6 +515,7 @@ def cmd_create(a) -> int:
     rid = res["room_id"]
     print(f"[create] room OPEN: {rid}")
     print(f"[create] seats: {json.dumps(res['role_assignments'])}")
+    print(f"[create] channels: {', '.join(res.get('channels') or [DEFAULT_CHANNEL])}")
     open_seats = [r for r in res["roles"] if r not in res["role_assignments"]]
     if open_seats:
         print(f"[create] open seats for others: {', '.join(open_seats)}")
@@ -491,8 +544,9 @@ def cmd_rooms(a) -> int:
         mark = "* " if room.get("mine") else "  "
         seats = ", ".join(room["roles"])
         opens = ", ".join(room["open_seats"]) or "(none)"
+        chans = ", ".join(room.get("channels") or [DEFAULT_CHANNEL])
         print(f"{mark}{room['room_id']}  seats[{seats}]  open[{opens}]  "
-              f"members[{', '.join(room['members'])}]")
+              f"members[{', '.join(room['members'])}]  channels[{chans}]")
     print("  (* = you're in it)")
     return 0
 
@@ -548,9 +602,13 @@ def cmd_leave(a) -> int:
 
 def cmd_who(a) -> int:
     """Live presence roster (native): who is actually attached to this room right now."""
+    channel = getattr(a, "channel", None) or DEFAULT_CHANNEL
     async def _who():
         from native_client import NativeClient
+        # the "general" mint already carries every declared channel's subject (server mints
+        # all of them) -- no channel-specific attach needed just to check presence.
         meta = _load_native_meta(a.room, a.role)
+        chan_subject = (meta.get("channels") or {}).get(channel) or meta["channel"]
         client = NativeClient(a.door_native, meta["creds"], name=f"{a.role}-who")
         await client.connect()
         try:
@@ -579,8 +637,8 @@ def cmd_who(a) -> int:
                 continue
             if not r.get("name") or not r.get("room"):
                 continue                          # cotal's own daemons heartbeat here too
-            if r.get("room") != meta["channel"]:
-                continue                          # presence is space-wide; show this room only
+            if r.get("room") != chan_subject:
+                continue                          # presence is space-wide; show this channel only
             try:                                  # timegm: the timestamp is UTC (mktime is not)
                 at = calendar.timegm(time.strptime(r.get("at", ""), "%Y-%m-%dT%H:%M:%SZ"))
             except Exception:  # noqa: BLE001
@@ -610,12 +668,21 @@ def main(argv=None) -> int:
         sp.add_argument("--native", action="store_true",
                         help="use the Cotal-native mesh (minted creds: server-side replay, "
                              "push delivery, presence, attributed publishes)")
+        if name in ("attach", "listen", "read", "post", "who"):
+            sp.add_argument("--channel", default=DEFAULT_CHANNEL,
+                            help="multi-channel room (P1): which declared channel to use "
+                                 "(default 'general'). attach/listen bind ONE channel per "
+                                 "listener process -- attach again with a different --channel "
+                                 "to also watch that one (each mints its own cred).")
         if name == "post":
             sp.add_argument("--text", required=True)
         if name == "create":
             sp.add_argument("--roles", required=True, help="comma-separated seats, e.g. coder,tester")
             sp.add_argument("--assign", default="", help="role:member,role:member (invite others)")
             sp.add_argument("--turn-timeout", type=float, default=7200.0)
+            sp.add_argument("--channels", default="",
+                            help="comma-separated extra channels beyond 'general', e.g. "
+                                 "judges,website (P1)")
     a = ap.parse_args(argv)
     return {"attach": cmd_attach, "listen": cmd_listen, "read": cmd_read,
             "post": cmd_post, "who": cmd_who, "leave": cmd_leave,
